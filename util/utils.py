@@ -496,7 +496,24 @@ def get_xywh(input):
     return x, y, w, h
 
 def get_xyxy(input):
-    x, y, xp, yp = input[0][0], input[0][1], input[2][0], input[2][1]
+    # Handle both list of points format [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] and simple [x1, y1, x2, y2] format
+    try:
+        if isinstance(input, (list, tuple)) and len(input) > 0:
+            if isinstance(input[0], (list, tuple)) and len(input[0]) == 2:
+                # Format: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                x, y, xp, yp = input[0][0], input[0][1], input[2][0], input[2][1]
+            elif len(input) >= 4 and isinstance(input[0], (int, float)):
+                # Format: [x1, y1, x2, y2]
+                x, y, xp, yp = input[0], input[1], input[2], input[3]
+            else:
+                # Fallback: assume nested structure
+                x, y, xp, yp = input[0][0], input[0][1], input[2][0], input[2][1]
+        else:
+            raise ValueError(f"Unexpected input format: {input}")
+    except (IndexError, TypeError) as e:
+        print(f"Error in get_xyxy with input: {input}, error: {e}")
+        raise
+    
     x, y, xp, yp = int(x), int(y), int(xp), int(yp)
     return x, y, xp, yp
 
@@ -518,9 +535,27 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
             text_threshold = 0.5
         else:
             text_threshold = easyocr_args['text_threshold']
-        result = paddle_ocr.ocr(image_np, cls=False)[0]
-        coord = [item[0] for item in result if item[1][1] > text_threshold]
-        text = [item[1][0] for item in result if item[1][1] > text_threshold]
+        result = paddle_ocr.ocr(image_np)[0]
+        # PaddleOCR returns a list where each item is: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]], (text, confidence)]
+        # Handle both old and new PaddleOCR formats
+        coord = []
+        text = []
+        if result:
+            print(f"PaddleOCR result sample: {result[0] if result else 'empty'}")
+        for item in result:
+            try:
+                if isinstance(item[1], (tuple, list)) and len(item[1]) >= 2:
+                    # New format: (text, confidence)
+                    if item[1][1] > text_threshold:
+                        coord.append(item[0])
+                        text.append(item[1][0])
+                else:
+                    # Old format or different structure - just treat item[1] as text with default confidence
+                    coord.append(item[0])
+                    text.append(item[1])
+            except (IndexError, TypeError) as e:
+                print(f"Error processing PaddleOCR item: {item}, error: {e}")
+                continue
     else:  # EasyOCR
         if easyocr_args is None:
             easyocr_args = {}
