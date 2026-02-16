@@ -398,13 +398,190 @@ def predict_yolo(model, image, box_threshold, imgsz, scale_img, iou_threshold=0.
 
     return boxes, conf, phrases
 
+def _cluster_1d(values_with_indices, tolerance):
+    """Cluster nearby 1D values using sort-and-merge.
+
+    Args:
+        values_with_indices: list of (pixel_value, box_index) tuples
+        tolerance: max pixel distance between values in same cluster
+
+    Returns:
+        list of clusters, each a list of (pixel_value, box_index) tuples
+    """
+    if not values_with_indices:
+        return []
+    sorted_vals = sorted(values_with_indices, key=lambda x: x[0])
+    clusters = [[sorted_vals[0]]]
+    for val_idx in sorted_vals[1:]:
+        if val_idx[0] - clusters[-1][-1][0] <= tolerance:
+            clusters[-1].append(val_idx)
+        else:
+            clusters.append([val_idx])
+    return clusters
+
+
+def _cluster_sizes(sizes_with_indices, tolerance):
+    """Cluster similar (width, height) pairs using sort-and-merge.
+
+    Args:
+        sizes_with_indices: list of (width_px, height_px, box_index) triples
+        tolerance: max difference in both w and h to belong to same cluster
+
+    Returns:
+        list of clusters, each a list of (width_px, height_px, box_index) triples
+    """
+    if not sizes_with_indices:
+        return []
+    sorted_sizes = sorted(sizes_with_indices, key=lambda x: (x[0], x[1]))
+    clusters = [[sorted_sizes[0]]]
+    for item in sorted_sizes[1:]:
+        merged = False
+        for cluster in clusters:
+            for member in cluster:
+                if abs(item[0] - member[0]) <= tolerance and abs(item[1] - member[1]) <= tolerance:
+                    cluster.append(item)
+                    merged = True
+                    break
+            if merged:
+                break
+        if not merged:
+            clusters.append([item])
+    return clusters
+
+
+def quantize_boxes(boxes, w, h, snap_tolerance_px=5):
+    """Post-process bounding boxes to exploit UI layout regularity.
+
+    Applies four strategies in order:
+    1. Size quantization (cluster similar sizes, snap to median preserving center)
+    2. Aspect ratio normalization (force near-square to exact square)
+    3. Edge alignment (cluster nearby edges, snap to median)
+    4. Integer pixel snap (final cleanup to pixel grid)
+
+    Size/aspect changes are applied first since they shift edges. Edge alignment
+    and pixel snap are applied last so their results aren't undone.
+
+    Only operates on type='icon' boxes; type='text' boxes pass through unchanged.
+
+    Args:
+        boxes: list of dicts with 'type' and 'bbox' keys ([x1,y1,x2,y2] normalized to [0,1])
+        w: image width in pixels
+        h: image height in pixels
+        snap_tolerance_px: clustering tolerance in pixels (default 5)
+
+    Returns:
+        list of dicts with quantized bbox values
+    """
+    import copy
+    boxes = copy.deepcopy(boxes)
+
+    icon_indices = [i for i, b in enumerate(boxes) if b.get('type') == 'icon']
+    if not icon_indices:
+        return boxes
+
+    # Strategy 1: Size quantization
+    sizes = []
+    for i in icon_indices:
+        bbox = boxes[i]['bbox']
+        bw = (bbox[2] - bbox[0]) * w
+        bh = (bbox[3] - bbox[1]) * h
+        sizes.append((bw, bh, i))
+
+    size_clusters = _cluster_sizes(sizes, snap_tolerance_px * 2)
+    for cluster in size_clusters:
+        if len(cluster) < 2:
+            continue
+        widths = sorted([s[0] for s in cluster])
+        heights = sorted([s[1] for s in cluster])
+        med_w = widths[len(widths) // 2]
+        med_h = heights[len(heights) // 2]
+        for _, _, box_idx in cluster:
+            bbox = boxes[box_idx]['bbox']
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+            half_w = (med_w / w) / 2
+            half_h = (med_h / h) / 2
+            new_bbox = [cx - half_w, cy - half_h, cx + half_w, cy + half_h]
+            new_bbox[0] = max(0, new_bbox[0])
+            new_bbox[1] = max(0, new_bbox[1])
+            new_bbox[2] = min(1, new_bbox[2])
+            new_bbox[3] = min(1, new_bbox[3])
+            boxes[box_idx]['bbox'] = new_bbox
+
+    # Strategy 2: Aspect ratio normalization
+    for i in icon_indices:
+        bbox = boxes[i]['bbox']
+        bw = (bbox[2] - bbox[0]) * w
+        bh = (bbox[3] - bbox[1]) * h
+        if min(bw, bh) > 0 and max(bw, bh) / min(bw, bh) < 1.15:
+            avg = (bw + bh) / 2
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+            half_w = (avg / w) / 2
+            half_h = (avg / h) / 2
+            new_bbox = [cx - half_w, cy - half_h, cx + half_w, cy + half_h]
+            new_bbox[0] = max(0, new_bbox[0])
+            new_bbox[1] = max(0, new_bbox[1])
+            new_bbox[2] = min(1, new_bbox[2])
+            new_bbox[3] = min(1, new_bbox[3])
+            boxes[i]['bbox'] = new_bbox
+
+    # Strategy 3: Edge alignment snapping
+    for axis, dim in [(0, w), (1, h), (2, w), (3, h)]:
+        vals = [(boxes[i]['bbox'][axis] * dim, i) for i in icon_indices]
+        clusters = _cluster_1d(vals, snap_tolerance_px)
+        for cluster in clusters:
+            if len(cluster) < 2:
+                continue
+            values = sorted([v for v, _ in cluster])
+            median = values[len(values) // 2]
+            for _, box_idx in cluster:
+                boxes[box_idx]['bbox'][axis] = median / dim
+
+    # Ensure valid boxes after edge alignment
+    for i in icon_indices:
+        bbox = boxes[i]['bbox']
+        if bbox[2] <= bbox[0]:
+            bbox[2] = bbox[0] + 1.0 / w
+        if bbox[3] <= bbox[1]:
+            bbox[3] = bbox[1] + 1.0 / h
+
+    # Strategy 4: Integer pixel snap (round size and center to preserve uniformity)
+    for i in icon_indices:
+        bbox = boxes[i]['bbox']
+        x1 = bbox[0] * w
+        y1 = bbox[1] * h
+        x2 = bbox[2] * w
+        y2 = bbox[3] * h
+        bw = max(1, round(x2 - x1))
+        bh = max(1, round(y2 - y1))
+        cx = round((x1 + x2) / 2)
+        cy = round((y1 + y2) / 2)
+        px_x1 = cx - bw // 2
+        px_x2 = px_x1 + bw
+        px_y1 = cy - bh // 2
+        px_y2 = px_y1 + bh
+        # Clamp to image bounds, shifting the box if needed
+        if px_x1 < 0:
+            px_x1, px_x2 = 0, bw
+        if px_y1 < 0:
+            px_y1, px_y2 = 0, bh
+        if px_x2 > w:
+            px_x1, px_x2 = w - bw, w
+        if px_y2 > h:
+            px_y1, px_y2 = h - bh, h
+        boxes[i]['bbox'] = [px_x1 / w, px_y1 / h, px_x2 / w, px_y2 / h]
+
+    return boxes
+
+
 def int_box_area(box, w, h):
     x1, y1, x2, y2 = box
     int_box = [int(x1*w), int(y1*h), int(x2*w), int(y2*h)]
     area = (int_box[2] - int_box[0]) * (int_box[3] - int_box[1])
     return area
 
-def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128):
+def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128, snap_enabled=False, snap_tolerance_px=5):
     """Process either an image path or Image object
     
     Args:
@@ -434,7 +611,10 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
     ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0] 
     xyxy_elem = [{'type': 'icon', 'bbox':box, 'interactivity':True, 'content':None} for box in xyxy.tolist() if int_box_area(box, w, h) > 0]
     filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem)
-    
+
+    if snap_enabled:
+        filtered_boxes = quantize_boxes(filtered_boxes, w, h, snap_tolerance_px=snap_tolerance_px)
+
     # sort the filtered_boxes so that the one with 'content': None is at the end, and get the index of the first 'content': None
     filtered_boxes_elem = sorted(filtered_boxes, key=lambda x: x['content'] is None)
     # get the index of the first 'content': None

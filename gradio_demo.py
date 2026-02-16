@@ -37,7 +37,9 @@ def process(
     box_threshold,
     iou_threshold,
     use_paddleocr,
-    imgsz
+    imgsz,
+    snap_enabled,
+    snap_tolerance_px
 ) -> Optional[Image.Image]:
 
     box_overlay_ratio = image_input.size[0] / 3200
@@ -51,7 +53,7 @@ def process(
 
     ocr_bbox_rslt, is_goal_filtered = check_ocr_box(image_input, display_img = False, output_bb_format='xyxy', goal_filtering=None, easyocr_args={'paragraph': False, 'text_threshold':0.9}, use_paddleocr=use_paddleocr)
     text, ocr_bbox = ocr_bbox_rslt
-    dino_labled_img, label_coordinates, parsed_content_list = get_som_labeled_img(image_input, yolo_model, BOX_TRESHOLD = box_threshold, output_coord_in_ratio=True, ocr_bbox=ocr_bbox,draw_bbox_config=draw_bbox_config, caption_model_processor=caption_model_processor, ocr_text=text,iou_threshold=iou_threshold, imgsz=imgsz,)  
+    dino_labled_img, label_coordinates, parsed_content_list = get_som_labeled_img(image_input, yolo_model, BOX_TRESHOLD = box_threshold, output_coord_in_ratio=True, ocr_bbox=ocr_bbox,draw_bbox_config=draw_bbox_config, caption_model_processor=caption_model_processor, ocr_text=text,iou_threshold=iou_threshold, imgsz=imgsz, snap_enabled=snap_enabled, snap_tolerance_px=snap_tolerance_px)
     image = Image.open(io.BytesIO(base64.b64decode(dino_labled_img)))
     print('finish processing')
     parsed_content_list = '\n'.join([f'icon {i}: ' + str(v) for i,v in enumerate(parsed_content_list)])
@@ -74,6 +76,10 @@ with gr.Blocks() as demo:
                 label='Use PaddleOCR', value=True)
             imgsz_component = gr.Slider(
                 label='Icon Detect Image Size', minimum=640, maximum=1920, step=32, value=640)
+            snap_enabled_component = gr.Checkbox(
+                label='Enable Box Snapping', value=False)
+            snap_tolerance_component = gr.Slider(
+                label='Snap Tolerance (px)', minimum=1, maximum=20, step=1, value=5)
             submit_button_component = gr.Button(
                 value='Submit', variant='primary')
         with gr.Column():
@@ -87,7 +93,9 @@ with gr.Blocks() as demo:
             box_threshold_component,
             iou_threshold_component,
             use_paddleocr_component,
-            imgsz_component
+            imgsz_component,
+            snap_enabled_component,
+            snap_tolerance_component
         ],
         outputs=[image_output_component, text_output_component]
     )
