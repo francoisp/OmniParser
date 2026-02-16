@@ -21,14 +21,9 @@ import easyocr
 from paddleocr import PaddleOCR
 reader = easyocr.Reader(['en'])
 paddle_ocr = PaddleOCR(
-    lang='en',  # other lang also available
-    use_angle_cls=False,
-    use_gpu=False,  # using cuda will conflict with pytorch in the same process
-    show_log=False,
-    max_batch_size=1024,
-    use_dilation=True,  # improves accuracy
-    det_db_score_mode='slow',  # improves accuracy
-    rec_batch_num=1024)
+     use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    use_textline_orientation=False)
 import time
 import base64
 
@@ -62,9 +57,9 @@ def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2
         from transformers import AutoProcessor, AutoModelForCausalLM 
         processor = AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
         if device == 'cpu':
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32, trust_remote_code=True, attn_implementation="eager")
         else:
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float16, trust_remote_code=True).to(device)
+            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float16, trust_remote_code=True, attn_implementation="eager").to(device)
     return {'model': model.to(device), 'processor': processor}
 
 
@@ -112,7 +107,16 @@ def get_parsed_content_icon(filtered_boxes, starting_idx, image_source, caption_
         else:
             inputs = processor(images=batch, text=[prompt]*len(batch), return_tensors="pt").to(device=device)
         if 'florence' in model.config.name_or_path:
-            generated_ids = model.generate(input_ids=inputs["input_ids"],pixel_values=inputs["pixel_values"],max_new_tokens=20,num_beams=1, do_sample=False)
+            generated_ids = model.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=20,
+                num_beams=1, 
+                do_sample=False,
+                use_cache=False,
+                pad_token_id=processor.tokenizer.pad_token_id,
+                eos_token_id=processor.tokenizer.eos_token_id
+            )
         else:
             generated_ids = model.generate(**inputs, max_length=100, num_beams=5, no_repeat_ngram_size=2, early_stopping=True, num_return_sequences=1) # temperature=0.01, do_sample=True,
         generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)
@@ -672,7 +676,24 @@ def get_xywh(input):
     return x, y, w, h
 
 def get_xyxy(input):
-    x, y, xp, yp = input[0][0], input[0][1], input[2][0], input[2][1]
+    # Handle both list of points format [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] and simple [x1, y1, x2, y2] format
+    try:
+        if isinstance(input, (list, tuple)) and len(input) > 0:
+            if isinstance(input[0], (list, tuple)) and len(input[0]) == 2:
+                # Format: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                x, y, xp, yp = input[0][0], input[0][1], input[2][0], input[2][1]
+            elif len(input) >= 4 and isinstance(input[0], (int, float)):
+                # Format: [x1, y1, x2, y2]
+                x, y, xp, yp = input[0], input[1], input[2], input[3]
+            else:
+                # Fallback: assume nested structure
+                x, y, xp, yp = input[0][0], input[0][1], input[2][0], input[2][1]
+        else:
+            raise ValueError(f"Unexpected input format: {input}")
+    except (IndexError, TypeError) as e:
+        print(f"Error in get_xyxy with input: {input}, error: {e}")
+        raise
+    
     x, y, xp, yp = int(x), int(y), int(xp), int(yp)
     return x, y, xp, yp
 
@@ -694,9 +715,27 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
             text_threshold = 0.5
         else:
             text_threshold = easyocr_args['text_threshold']
-        result = paddle_ocr.ocr(image_np, cls=False)[0]
-        coord = [item[0] for item in result if item[1][1] > text_threshold]
-        text = [item[1][0] for item in result if item[1][1] > text_threshold]
+        result = paddle_ocr.ocr(image_np)[0]
+        # PaddleOCR returns a list where each item is: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]], (text, confidence)]
+        # Handle both old and new PaddleOCR formats
+        coord = []
+        text = []
+        if result:
+            print(f"PaddleOCR result sample: {result[0] if result else 'empty'}")
+        for item in result:
+            try:
+                if isinstance(item[1], (tuple, list)) and len(item[1]) >= 2:
+                    # New format: (text, confidence)
+                    if item[1][1] > text_threshold:
+                        coord.append(item[0])
+                        text.append(item[1][0])
+                else:
+                    # Old format or different structure - just treat item[1] as text with default confidence
+                    coord.append(item[0])
+                    text.append(item[1])
+            except (IndexError, TypeError) as e:
+                print(f"Error processing PaddleOCR item: {item}, error: {e}")
+                continue
     else:  # EasyOCR
         if easyocr_args is None:
             easyocr_args = {}
