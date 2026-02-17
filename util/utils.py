@@ -579,13 +579,48 @@ def quantize_boxes(boxes, w, h, snap_tolerance_px=5):
     return boxes
 
 
+def filter_blank_icons(icon_elems, image_np, w, h, stddev_threshold=5.0):
+    """Filter out YOLO detections that are solid/near-solid color regions.
+
+    UI screenshots often have blank areas (white panels, black bars) that
+    YOLO incorrectly detects as icons. This filter crops each detection
+    region, computes the pixel standard deviation, and drops regions below
+    the threshold.
+
+    Args:
+        icon_elems: list of icon dicts with 'bbox' as [x1,y1,x2,y2] normalized
+        image_np: numpy array (H, W, 3) of the source image
+        w: image width in pixels
+        h: image height in pixels
+        stddev_threshold: drop icons with mean channel stddev below this (default 5.0)
+
+    Returns:
+        filtered list of icon dicts
+    """
+    kept = []
+    for elem in icon_elems:
+        bbox = elem['bbox']
+        x1 = max(0, int(bbox[0] * w))
+        y1 = max(0, int(bbox[1] * h))
+        x2 = min(w, int(bbox[2] * w))
+        y2 = min(h, int(bbox[3] * h))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = image_np[y1:y2, x1:x2]
+        # Mean stddev across RGB channels
+        std = float(crop.astype(np.float32).std(axis=(0, 1)).mean())
+        if std >= stddev_threshold:
+            kept.append(elem)
+    return kept
+
+
 def int_box_area(box, w, h):
     x1, y1, x2, y2 = box
     int_box = [int(x1*w), int(y1*h), int(x2*w), int(y2*h)]
     area = (int_box[2] - int_box[0]) * (int_box[3] - int_box[1])
     return area
 
-def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128, snap_enabled=False, snap_tolerance_px=5):
+def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128, snap_enabled=False, snap_tolerance_px=5, blank_filter_enabled=False, blank_stddev_threshold=5.0):
     """Process either an image path or Image object
     
     Args:
@@ -614,6 +649,10 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
 
     ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0] 
     xyxy_elem = [{'type': 'icon', 'bbox':box, 'interactivity':True, 'content':None} for box in xyxy.tolist() if int_box_area(box, w, h) > 0]
+    if blank_filter_enabled:
+        n_before = len(xyxy_elem)
+        xyxy_elem = filter_blank_icons(xyxy_elem, image_source, w, h, blank_stddev_threshold)
+        print(f'blank filter: {n_before} -> {len(xyxy_elem)} icons ({n_before - len(xyxy_elem)} blank removed)')
     filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem)
 
     if snap_enabled:
