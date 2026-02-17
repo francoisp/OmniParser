@@ -1,0 +1,122 @@
+# Dockerfile.runpod - RunPod serverless deployment with prebaked models
+#
+# Build:  docker build -f Dockerfile.runpod -t omniparser-runpod:latest .
+# Run:    docker run --gpus all omniparser-runpod:latest
+
+FROM nvidia/cuda:12.8.0-base-ubuntu22.04
+
+ENV PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DISABLE_REQUIRE=1 \
+    DEVICE=cuda \
+    SOM_MODEL_PATH=/app/weights/icon_detect/model.pt \
+    CAPTION_MODEL_NAME=florence2 \
+    CAPTION_MODEL_PATH=/app/weights/icon_caption_florence \
+    BOX_TRESHOLD=0.05 \
+    PADDLEOCR_HOME=/root/.paddleocr
+
+# Base OS deps + build toolchain + runtime libs
+RUN apt-get update && apt-get install -y \
+    curl git wget build-essential libssl-dev libffi-dev python3-dev \
+    libbz2-dev liblzma-dev libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 \
+    libxrender-dev libgomp1 && rm -rf /var/lib/apt/lists/*
+
+# Python 3.12
+RUN cd /tmp && wget https://www.python.org/ftp/python/3.12.0/Python-3.12.0.tgz && \
+    tar xzf Python-3.12.0.tgz && cd Python-3.12.0 && ./configure --prefix=/usr/local && \
+    make -j"$(nproc)" && make install && cd .. && rm -rf Python-3.12.0 Python-3.12.0.tgz
+
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+WORKDIR /app
+
+# Requirements + RunPod SDK
+COPY requirements.txt /tmp/requirements.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt && \
+    python3 -m pip install --no-cache-dir runpod
+
+# Copy full repo
+COPY . /app
+
+# ============================================================================
+# PREBAKED MODELS
+# ============================================================================
+
+# --- SOM (YOLO) model ---
+RUN mkdir -p /app/weights/icon_detect && \
+    if [ -f weights/icon_detect/model.pt ] && [ "$(stat -c%s weights/icon_detect/model.pt 2>/dev/null || stat -f%z weights/icon_detect/model.pt 2>/dev/null)" -gt 1000 ]; then \
+        echo "Using local SOM model from weights/..."; \
+    else \
+        echo "Downloading SOM model..." && \
+        wget -O /app/weights/icon_detect/model.pt \
+            "https://huggingface.co/microsoft/OmniParser-v2.0/resolve/main/icon_detect/model.pt?download=true" && \
+        wget -O /app/weights/icon_detect/model.yaml \
+            "https://huggingface.co/microsoft/OmniParser-v2.0/resolve/main/icon_detect/model.yaml?download=true" && \
+        wget -O /app/weights/icon_detect/train_args.yaml \
+            "https://huggingface.co/microsoft/OmniParser-v2.0/resolve/main/icon_detect/train_args.yaml?download=true"; \
+    fi && \
+    echo "SOM model ready"
+
+# --- Florence-2 model + processor ---
+RUN mkdir -p /app/weights/icon_caption_florence && \
+    if [ -f weights/icon_caption_florence/model.safetensors ]; then \
+        echo "Using local Florence-2 model weights from weights/..."; \
+    else \
+        echo "Downloading Florence-2 model..." && \
+        python3 -c "\
+import os, torch; \
+from transformers import AutoModelForCausalLM; \
+save_path = '/app/weights/icon_caption_florence'; \
+os.makedirs(save_path, exist_ok=True); \
+model = AutoModelForCausalLM.from_pretrained('microsoft/Florence-2-base', trust_remote_code=True, torch_dtype=torch.float16, attn_implementation='eager'); \
+model.save_pretrained(save_path); \
+print('Florence-2 model downloaded'); \
+"; \
+    fi && \
+    echo "Florence-2 model ready"
+
+# Save Florence-2 processor into the model directory (always, since local weights don't include it)
+RUN python3 -c "\
+from transformers import AutoProcessor; \
+save_path = '/app/weights/icon_caption_florence'; \
+print('Saving Florence-2 processor...'); \
+processor = AutoProcessor.from_pretrained('microsoft/Florence-2-base', trust_remote_code=True); \
+processor.save_pretrained(save_path); \
+print('Florence-2 processor saved'); \
+"
+
+# --- EasyOCR models ---
+RUN python3 -c "\
+import easyocr; \
+print('Downloading EasyOCR models...'); \
+reader = easyocr.Reader(['en']); \
+print('EasyOCR models ready'); \
+"
+
+# --- PaddleOCR models ---
+RUN mkdir -p /root/.paddleocr && \
+    python3 -c "\
+import os; \
+os.environ['PADDLEOCR_HOME'] = '/root/.paddleocr'; \
+from paddleocr import PaddleOCR; \
+print('Downloading PaddleOCR models...'); \
+PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, lang='en'); \
+print('PaddleOCR models ready'); \
+"
+
+# ============================================================================
+# VERIFICATION - fail build if any model is missing
+# ============================================================================
+RUN test -f /app/weights/icon_detect/model.pt || (echo "ERROR: SOM model not found!" && exit 1)
+RUN test -f /app/weights/icon_caption_florence/model.safetensors || (echo "ERROR: Florence-2 model not found!" && exit 1)
+RUN test -f /app/weights/icon_caption_florence/preprocessor_config.json || (echo "ERROR: Florence-2 processor not found!" && exit 1)
+RUN test -d /root/.EasyOCR/model || (echo "ERROR: EasyOCR models not found!" && exit 1)
+RUN test -d /root/.paddleocr/whl || (echo "ERROR: PaddleOCR models not found!" && exit 1)
+
+RUN chmod -R 755 /app/weights /root/.paddleocr
+
+LABEL org.opencontainers.image.title="OmniParser RunPod Serverless" \
+      org.opencontainers.image.description="OmniParser with prebaked models for RunPod serverless (runsync compatible)"
+
+CMD ["python3", "-u", "runpod_handler.py"]
