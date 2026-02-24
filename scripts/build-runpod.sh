@@ -3,7 +3,7 @@
 set -e
 
 REGISTRY="${REGISTRY:-docker.io}"
-IMAGE_NAME="${IMAGE_NAME:-omniparser-runpod}"
+IMAGE_NAME="${IMAGE_NAME:-zparser-runpod}"
 VERSION="${VERSION:-latest}"
 
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
